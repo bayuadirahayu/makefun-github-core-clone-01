@@ -3,7 +3,8 @@
 // Store: in-memory only. Deterministic: no wall clock, no randomness, no port/date
 // in stored state (server commit timestamps come from a monotonic counter off a fixed base).
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -918,6 +919,10 @@ function requireAuth(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // The transport already buffered the whole body before dispatching: take
+  // it straight instead of replaying data/end events through a Promise.
+  const pre = (req as unknown as { preBody?: Buffer }).preBody;
+  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -952,6 +957,8 @@ function parseJsonBody(raw: Buffer): Record<string, unknown> {
 
 function splitPath(pathname: string): string[] {
   return pathname.split('/').filter((part) => part !== '').map((part) => {
+    // Most segments carry no escapes; decoding one is a wasted call.
+    if (!part.includes('%')) return part;
     try {
       return decodeURIComponent(part);
     } catch {
@@ -3954,8 +3961,23 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
 // ---------------------------------------------------------------------------
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const pathname = url.pathname;
+  // The request target is an origin-form path (absolute-form tolerated).
+  // Split it by hand: a full WHATWG URL parse per request is pure overhead
+  // on this hot path, and splitPath below does the segment decoding.
+  const rawUrl = req.url ?? '/';
+  let pathname = rawUrl;
+  let queryString = '';
+  const qmark = rawUrl.indexOf('?');
+  if (qmark >= 0) {
+    pathname = rawUrl.slice(0, qmark);
+    queryString = rawUrl.slice(qmark + 1);
+  }
+  if (pathname.startsWith('http://') || pathname.startsWith('https://')) {
+    const afterScheme = pathname.indexOf('://') + 3;
+    const slash = pathname.indexOf('/', afterScheme);
+    pathname = slash >= 0 ? pathname.slice(slash) : '/';
+  }
+  const query = new URLSearchParams(queryString);
   const method = req.method ?? 'GET';
   const segments = splitPath(pathname);
 
@@ -3984,7 +4006,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
   if (segments[0] === 'api' && segments[1] === 'v3') {
-    await handleRest(req, res, segments, url.searchParams, method);
+    await handleRest(req, res, segments, query, method);
     return;
   }
   if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
@@ -3996,7 +4018,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         sendError(res, 404, 'Repository not found');
         return;
       }
-      const service = url.searchParams.get('service') ?? '';
+      const service = query.get('service') ?? '';
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendError(res, 400, 'service is required');
         return;
@@ -4026,27 +4048,405 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   sendError(res, 404, 'Not Found');
 }
 
-export function createApp(): Server {
-  const server = createServer((req, res) => {
-    void handleRequest(req, res).catch((err) => {
+// ---------------------------------------------------------------------------
+// transport: a minimal HTTP/1.1 server on node:net
+// ---------------------------------------------------------------------------
+//
+// node:http spends most of its per-request budget on IncomingMessage /
+// ServerResponse bookkeeping: the header parser, the stream machinery, one
+// writev per response part. The suite's only client is undici fetch speaking
+// plain HTTP/1.1 with Content-Length bodies over keep-alive connections, so
+// the forge can serve the same wire with a small purpose-built transport:
+// parse the request line, headers and body straight off the socket, hand the
+// handlers a narrow request/response shim, and answer with a single socket
+// write. Every handler, route, status code and body is unchanged — only the
+// transport moves.
+//
+// The whole surface the handlers touch (nothing else is provided on purpose):
+//   req: .method, .url, .headers (lower-cased names), .on('data' | 'end' |
+//        'error'), .destroy()
+//   res: .writeHead(status, headers), .end(body?), .headersSent
+
+/** Reason phrases for the statuses the forge sends. */
+const HTTP_REASON: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  413: 'Content Too Large',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+/** Largest request head the transport accepts before refusing the socket. */
+const MAX_HEAD_BYTES = 64 * 1024;
+/** Largest request body the transport buffers (readBody refuses past 64 MiB). */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+/** A request head: everything before the body, with its byte length. */
+interface RequestHead {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  version: string;
+  headLength: number;
+  closeAfter: boolean;
+}
+
+/**
+ * Parse one request head from the front of `buf`. Returns null when more
+ * data is needed; throws when the wire cannot carry the request (bad framing,
+ * absurd sizes).
+ */
+function parseHttpHead(buf: Buffer): RequestHead | null {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) {
+    if (buf.length > MAX_HEAD_BYTES) throw new Error('request head too large');
+    return null;
+  }
+  if (headEnd > MAX_HEAD_BYTES) throw new Error('request head too large');
+  const head = buf.subarray(0, headEnd).toString('ascii');
+  const lines = head.split('\r\n');
+  const requestLine = lines[0] ?? '';
+  const parts = requestLine.split(' ');
+  if (parts.length !== 3 || parts[0] === '' || parts[1] === '' || !(parts[2] ?? '').startsWith('HTTP/')) {
+    throw new Error('malformed request line');
+  }
+  const headers: Record<string, string> = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon <= 0) throw new Error('malformed header line');
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    headers[name] = headers[name] === undefined ? value : `${headers[name]}, ${value}`;
+  }
+  const version = parts[2]!;
+  const connection = (headers['connection'] ?? '').toLowerCase();
+  return {
+    method: parts[0]!,
+    url: parts[1]!,
+    headers,
+    version,
+    headLength: headEnd + 4,
+    closeAfter: connection.includes('close') || (version === 'HTTP/1.0' && !connection.includes('keep-alive')),
+  };
+}
+
+/**
+ * Read one request body from `buf` (which starts just past the head). Returns
+ * the body and the bytes consumed, or null when more data is needed. Throws
+ * on framing the wire cannot carry. Handles Content-Length bodies and
+ * chunked transfer-encoding.
+ */
+function readHttpBody(head: RequestHead, buf: Buffer): { body: Buffer; consumed: number } | null {
+  const chunked = (head.headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked');
+  if (chunked) {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let offset = 0;
+    for (;;) {
+      const lineEnd = buf.indexOf('\r\n', offset);
+      if (lineEnd < 0) return null;
+      const sizeText = buf.subarray(offset, lineEnd).toString('ascii').trim().split(';')[0] ?? '';
+      const size = Number.parseInt(sizeText, 16);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error('malformed chunk size');
+      offset = lineEnd + 2;
+      if (size === 0) {
+        // Trailers run to the next empty line.
+        let at = offset;
+        for (;;) {
+          const lineEnd = buf.indexOf('\r\n', at);
+          if (lineEnd < 0) return null;
+          if (lineEnd === at) return { body: Buffer.concat(chunks, total), consumed: lineEnd + 2 };
+          at = lineEnd + 2;
+        }
+      }
+      if (offset + size + 2 > buf.length) return null;
+      total += size;
+      if (total > MAX_BODY_BYTES) throw new Error('request body too large');
+      chunks.push(buf.subarray(offset, offset + size));
+      offset += size + 2;
+    }
+  }
+  const rawLength = head.headers['content-length'];
+  const length = rawLength === undefined ? 0 : Number.parseInt(rawLength, 10);
+  if (!Number.isSafeInteger(length) || length < 0) throw new Error('malformed content-length');
+  if (length > MAX_BODY_BYTES) throw new Error('request body too large');
+  if (buf.length < length) return null;
+  return { body: Buffer.from(buf.subarray(0, length)), consumed: length };
+}
+
+/** One fully parsed request, ready for the handlers. */
+interface ParsedRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: Buffer;
+  closeAfter: boolean;
+}
+
+/** Request shim: the narrow IncomingMessage surface the handlers use. */
+class ShimRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly headers: Record<string, string>;
+  /** The transport already holds the whole body: readBody takes it directly. */
+  readonly preBody: Buffer;
+  private readonly socket: Socket;
+  private destroyedFlag = false;
+  private delivered = false;
+  private dataListeners: Array<(chunk: Buffer) => void> = [];
+  private endListeners: Array<() => void> = [];
+  private errorListeners: Array<(err: Error) => void> = [];
+
+  constructor(method: string, url: string, headers: Record<string, string>, body: Buffer, socket: Socket) {
+    this.method = method;
+    this.url = url;
+    this.headers = headers;
+    this.preBody = body;
+    this.socket = socket;
+  }
+
+  on(event: 'data', listener: (chunk: Buffer) => void): this;
+  on(event: 'end', listener: () => void): this;
+  on(event: 'error', listener: (err: Error) => void): this;
+  on(event: string, listener: (...args: never[]) => void): this {
+    if (event === 'data') this.dataListeners.push(listener as (chunk: Buffer) => void);
+    else if (event === 'end') this.endListeners.push(listener as () => void);
+    else if (event === 'error') this.errorListeners.push(listener as (err: Error) => void);
+    if (!this.delivered) {
+      // Deliver on a microtask so every listener readBody registers below is
+      // in place before the first one fires.
+      this.delivered = true;
+      queueMicrotask(() => this.deliver());
+    }
+    return this;
+  }
+
+  private deliver(): void {
+    if (this.destroyedFlag) return;
+    if (this.preBody.length > 0) for (const listener of this.dataListeners) listener(this.preBody);
+    for (const listener of this.endListeners) listener();
+  }
+
+  /** Fail the request (socket died mid-flight): readBody rejects. */
+  fail(err: Error): void {
+    if (this.destroyedFlag) return;
+    this.destroyedFlag = true;
+    for (const listener of this.errorListeners) listener(err);
+  }
+
+  destroy(): void {
+    this.destroyedFlag = true;
+    try {
+      this.socket.destroy();
+    } catch {
+      // The socket is already gone.
+    }
+  }
+}
+
+/** Response shim: the narrow ServerResponse surface the handlers use. */
+class ShimResponse {
+  headersSent = false;
+  private status = 200;
+  private headers: Record<string, string> = {};
+  private done = false;
+  private readonly socket: Socket;
+  private readonly method: string;
+  private readonly closeAfter: boolean;
+  private readonly onFinished: () => void;
+
+  constructor(socket: Socket, method: string, closeAfter: boolean, onFinished: () => void) {
+    this.socket = socket;
+    this.method = method;
+    this.closeAfter = closeAfter;
+    this.onFinished = onFinished;
+  }
+
+  writeHead(status: number, headers: Record<string, string>): void {
+    this.status = status;
+    this.headers = headers;
+    this.headersSent = true;
+  }
+
+  get ended(): boolean {
+    return this.done;
+  }
+
+  end(body?: string | Buffer): void {
+    if (this.done) return;
+    this.done = true;
+    const payload = body === undefined ? Buffer.alloc(0) : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+    let head = `HTTP/1.1 ${this.status} ${HTTP_REASON[this.status] ?? ''}\r\n`;
+    for (const [name, value] of Object.entries(this.headers)) head += `${name}: ${value}\r\n`;
+    head += `connection: ${this.closeAfter ? 'close' : 'keep-alive'}\r\n\r\n`;
+    // A HEAD answer carries the headers but no body.
+    const bytes =
+      this.method === 'HEAD' ? Buffer.from(head, 'ascii') : Buffer.concat([Buffer.from(head, 'ascii'), payload]);
+    try {
+      this.socket.write(bytes);
+    } catch {
+      // The socket is already gone; the answer has nowhere to go.
+    }
+    this.onFinished();
+    if (this.closeAfter) {
       try {
-        process.stderr.write(`[entry] request error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+        this.socket.end();
       } catch {
-        // stderr is gone; nothing left to do
+        // Already gone.
       }
-      if (!res.headersSent) {
-        try {
-          sendError(res, err instanceof HttpError ? err.status : 500, err instanceof Error ? err.message : 'Internal Server Error');
-        } catch {
-          // the socket is already gone; nothing left to do
-        }
-      } else {
-        try {
-          res.end();
-        } catch {
-          // the socket is already gone; nothing left to do
-        }
+    }
+  }
+}
+
+/** One socket's parse state: the buffered bytes, the queued requests, the one in flight. */
+interface SocketState {
+  socket: Socket;
+  buffer: Buffer;
+  head: RequestHead | null;
+  queue: ParsedRequest[];
+  busy: boolean;
+  currentRequest: ShimRequest | null;
+  alive: boolean;
+}
+
+/** Start the next queued request on a socket, if one is waiting and none runs. */
+function pumpSocket(state: SocketState): void {
+  if (!state.alive || state.busy || state.queue.length === 0) return;
+  state.busy = true;
+  const next = state.queue.shift()!;
+  void dispatchRequest(state, next);
+}
+
+/**
+ * Run one request through the handlers. The response is always written
+ * exactly once: by the handler, by the error path, or by the safety net
+ * below when a handler returns without answering.
+ */
+async function dispatchRequest(state: SocketState, parsed: ParsedRequest): Promise<void> {
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    state.busy = false;
+    // A microtask hop keeps a pipelined burst from nesting dispatch calls.
+    queueMicrotask(() => pumpSocket(state));
+  };
+  const req = new ShimRequest(parsed.method, parsed.url, parsed.headers, parsed.body, state.socket);
+  const res = new ShimResponse(state.socket, parsed.method, parsed.closeAfter, finish);
+  state.currentRequest = req;
+  try {
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+  } catch (err) {
+    try {
+      process.stderr.write(`[entry] request error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+    } catch {
+      // stderr is gone; nothing left to do
+    }
+    if (!res.headersSent) {
+      try {
+        sendError(res as unknown as ServerResponse, err instanceof HttpError ? err.status : 500, err instanceof Error ? err.message : 'Internal Server Error');
+      } catch {
+        // The socket is already gone.
       }
+    } else {
+      try {
+        (res as unknown as ServerResponse).end();
+      } catch {
+        // The socket is already gone.
+      }
+    }
+  } finally {
+    state.currentRequest = null;
+  }
+  if (!res.ended) {
+    try {
+      if (!res.headersSent) sendError(res as unknown as ServerResponse, 500, 'Internal Server Error');
+      else (res as unknown as ServerResponse).end();
+    } catch {
+      // The socket is already gone.
+    }
+  }
+  finish();
+}
+
+export function createApp(): TcpServer {
+  const server = createTcpServer((socket) => {
+    socket.setNoDelay(true);
+    const state: SocketState = {
+      socket,
+      buffer: Buffer.alloc(0),
+      head: null,
+      queue: [],
+      busy: false,
+      currentRequest: null,
+      alive: true,
+    };
+    const teardown = (): void => {
+      if (!state.alive) return;
+      state.alive = false;
+      state.queue.length = 0;
+      if (state.currentRequest !== null) state.currentRequest.fail(new Error('socket closed'));
+    };
+    socket.on('error', teardown);
+    socket.on('close', teardown);
+    socket.on('data', (chunk: Buffer) => {
+      if (!state.alive) return;
+      state.buffer = state.buffer.length === 0 ? chunk : Buffer.concat([state.buffer, chunk]);
+      try {
+        for (;;) {
+          if (state.head === null) {
+            const head = parseHttpHead(state.buffer);
+            if (head === null) break;
+            state.buffer = state.buffer.subarray(head.headLength);
+            state.head = head;
+            if ((head.headers['expect'] ?? '').toLowerCase() === '100-continue') {
+              socket.write('HTTP/1.1 100 Continue\r\n\r\n');
+            }
+          }
+          const bodyResult = readHttpBody(state.head, state.buffer);
+          if (bodyResult === null) break;
+          state.buffer = state.buffer.subarray(bodyResult.consumed);
+          state.queue.push({
+            method: state.head.method,
+            url: state.head.url,
+            headers: state.head.headers,
+            body: bodyResult.body,
+            closeAfter: state.head.closeAfter,
+          });
+          state.head = null;
+        }
+      } catch {
+        // Malformed wire: answer 400 and drop the connection.
+        const badBody = Buffer.from('{"message":"malformed request"}\n', 'utf8');
+        try {
+          socket.write(
+            Buffer.concat([
+              Buffer.from(
+                `HTTP/1.1 400 Bad Request\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${badBody.length}\r\nconnection: close\r\n\r\n`,
+                'ascii',
+              ),
+              badBody,
+            ]),
+          );
+        } catch {
+          // The socket is already gone.
+        }
+        state.alive = false;
+        try {
+          socket.destroy();
+        } catch {
+          // Already gone.
+        }
+        return;
+      }
+      pumpSocket(state);
     });
   });
   return server;
